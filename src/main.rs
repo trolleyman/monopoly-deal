@@ -18,6 +18,22 @@ pub enum PropertySet {
 	Utility,
 }
 impl PropertySet {
+	pub fn all() -> &'static [PropertySet] {
+		use crate::PropertySet::*;
+		&[
+			Brown,
+			LightBlue,
+			Pink,
+			Orange,
+			Red,
+			Yellow,
+			Green,
+			DarkBlue,
+			Station,
+			Utility,
+		]
+	}
+	
 	pub fn value(&self) -> u32 {
 		use crate::PropertySet::*;
 		match self {
@@ -402,7 +418,7 @@ pub const MAX_ACTIONS: usize = 3;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Action {
 	/// Build property
-	BuildProperty(usize),
+	BuildProperty(usize, PropertySet),
 	/// Take action card
 	TakeActionCard(usize),
 	/// Move card to bank (either action or money card)
@@ -417,7 +433,7 @@ pub enum Action {
 impl Action {
 	pub fn is_free_action(&self) -> bool {
 		match self {
-			Action::BuildProperty(_) => false,
+			Action::BuildProperty(_, _) => false,
 			Action::TakeActionCard(_) => false,
 			Action::MoveToBank(_) => false,
 			
@@ -479,7 +495,7 @@ impl Player {
 	pub fn num_full_sets(&self) -> usize {
 		let mut sets = 0;
 		for (set, cards) in self.properties.iter() {
-			if set.len() == cards.len() {
+			if cards.len() >= set.len() {
 				sets += 1;
 			}
 		}
@@ -510,6 +526,10 @@ impl Game {
 		for p in 0..game.players.len() {
 			game.dealn(p, 5);
 		}
+		
+		// Deal 2 cards from the deck to the starting player
+		game.dealn(game.current_player, 2);
+		
 		game
 	}
 	
@@ -549,9 +569,6 @@ impl Game {
 	pub fn step(&mut self) {
 		let p = self.current_player;
 		
-		// Deal 2 cards from the deck
-		self.dealn(p, 2);
-		
 		let mut ai: Box<dyn Ai> = self.players[p].ai.clone();
 		let action = ai.think(self);
 		self.take_action(action);
@@ -559,8 +576,8 @@ impl Game {
 	}
 	
 	pub fn get_valid_actions(&self) -> Vec<Action> {
-		let actions = Vec::new();
-		let p = self.players[self.current_player];
+		let mut actions = Vec::new();
+		let p = &self.players[self.current_player];
 		
 		// Add default actions
 		actions.push(Action::Skip);
@@ -592,22 +609,30 @@ impl Game {
 			return actions;
 		}
 		
+		// Add actions for each card in hand
 		for (i, card) in p.hand.iter().enumerate() {
 			match card {
-				// Build property
-				// Take action card
-				// Move card to bank (either action or money card)
 				Card::MoneyCard(_) => actions.push(Action::MoveToBank(i)),
-				Card::ActionCard(card) => {
-					actions.push(Action::)
+				Card::ActionCard(_) => {
+					actions.push(Action::TakeActionCard(i));
 					actions.push(Action::MoveToBank(i));
-				}
+				},
+				Card::PropertyCard(card) => match card {
+					PropertyCard::Wildcard(set_a, set_b) => {
+						actions.push(Action::BuildProperty(i, *set_a));
+						actions.push(Action::BuildProperty(i, *set_b));
+					},
+					PropertyCard::WildcardAny => {
+						for set in PropertySet::all() {
+							actions.push(Action::BuildProperty(i, *set));
+						}
+					},
+					PropertyCard::Property(p) => {
+						actions.push(Action::BuildProperty(i, p.set()));
+					}
+				},
 			}
 		}
-		// BuildProperty(usize),
-		// TakeActionCard(usize),
-		// MoveToBank(usize),
-		
 		actions
 	}
 	
@@ -616,8 +641,35 @@ impl Game {
 			self.actions_taken += 1;
 		}
 		
+		let p = &mut self.players[self.current_player];
+		
 		match action {
-			_ => unimplemented!(),
+			Action::BuildProperty(i, set) => {
+				let c = p.hand.remove(i);
+				if let Card::PropertyCard(c) = c {
+					println!("Built property in set {:?}: {:?}", &set, &c);
+					p.properties.entry(set).or_insert_with(|| Vec::new()).push(c);
+				} else {
+					panic!("invalid card (expected property card): {:?}", &c);
+				}
+			},
+			Action::TakeActionCard(i) => {
+				unimplemented!()
+			},
+			Action::MoveToBank(i) => {
+				let c = p.hand.remove(i);
+				println!("Moved card to bank: {:?}", &c);
+				p.bank.push(c);
+			},
+			Action::MovePropertyWildcard((set_from, i), set_to) => {
+				let c = p.properties.get_mut(&set_from).unwrap().remove(i);
+				p.properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
+			},
+			Action::Discard(i) => {
+				let c = p.hand.remove(i);
+				println!("Discarded card: {:?}", &c);
+				self.deck.push_back(c);
+			},
 			Action::Skip => {
 				self.next_player();
 			}
@@ -625,12 +677,13 @@ impl Game {
 	}
 	
 	pub fn next_player(&mut self) {
+		let p = &mut self.players[self.current_player];
 		// Check hand size
-		let p = self.players[self.current_player];
 		while p.hand.len() > MAX_CARDS_IN_HAND {
 			// Discard randomly
 			let c = p.hand.remove(thread_rng().gen_range(0, p.hand.len()));
-			println!("Discarded {:?}", c);
+			println!("Discarded card: {:?}", &c);
+			self.deck.push_back(c);
 		}
 		
 		// Go to next player
@@ -639,6 +692,9 @@ impl Game {
 			self.current_player = 0;
 		}
 		self.actions_taken = 0;
+		
+		// Deal 2 cards from the deck
+		self.dealn(self.current_player, 2);
 	}
 }
 
