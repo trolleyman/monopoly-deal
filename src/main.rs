@@ -326,6 +326,8 @@ impl PropertyCard {
 			},
 			PropertyCard::WildcardAny => 0,
 			PropertyCard::Property(p) => p.value(),
+			PropertyCard::House => ActionCard::House.value(),
+			PropertyCard::Hotel => ActionCard::Hotel.value(),
 		}
 	}
 	
@@ -497,7 +499,7 @@ pub enum Action {
 	/// Build property
 	BuildProperty(usize, PropertySet),
 	/// Take action card
-	TakeActionCard(usize, ActionCardAction),
+	UseActionCard(usize, ActionCardAction),
 	/// Move card to bank (either action or money card)
 	MoveToBank(usize),
 	/// Move property wildcard
@@ -511,7 +513,7 @@ impl Action {
 	pub fn is_free_action(&self) -> bool {
 		match self {
 			Action::BuildProperty(_, _) => false,
-			Action::TakeActionCard(_, _) => false,
+			Action::UseActionCard(_, _) => false,
 			Action::MoveToBank(_) => false,
 			
 			Action::MovePropertyWildcard(_, _) => true,
@@ -554,7 +556,7 @@ impl RandomAi {
 	}
 }
 impl Ai for RandomAi {
-	fn should_use_nope(&mut self, state: &GameState, action: ActionCardAction) -> bool {
+	fn should_use_nope(&mut self, _: &GameState, _: ActionCardAction) -> bool {
 		random()
 	}
 	fn think(&mut self, state: &GameState) -> Action {
@@ -615,25 +617,25 @@ impl Player {
 	
 	pub fn nonempty_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
 		self.properties.keys()
-			.filter(|set| self.is_property_set_nonempty(set))
+			.filter(move |&set| self.is_property_set_nonempty(set))
 			.cloned()
 	}
 	
 	pub fn full_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
 		self.properties.keys()
-			.filter(|set| self.is_property_set_full(set))
+			.filter(move |set| self.is_property_set_full(set))
 			.cloned()
 	}
 	
 	pub fn stealable_cards<'a>(&'a self) -> impl Iterator<Item=(PropertySet, usize)> + 'a {
 		self.properties.keys()
-			.filter(|set| self.is_property_set_nonempty(set))
-			.filter(|set| !self.is_property_set_full(set))
-			.flat_map(|set|
-				self.properties[set].iter()
+			.filter(move |set| self.is_property_set_nonempty(set))
+			.filter(move |set| !self.is_property_set_full(set))
+			.flat_map(move |&set|
+				self.properties[&set].iter()
+					.filter(|card| card.is_stealable())
 					.enumerate()
-					.filter(|(i, card)| card.is_stealable())
-					.map(|(i, _)| (*set, i))
+					.map(move |(i, _)| (set, i))
 			)
 	}
 }
@@ -673,7 +675,8 @@ impl GameState {
 							.map(|&set_to| Action::MovePropertyWildcard((set, i), set_to))
 							.for_each(|a| actions.push(a));
 					},
-					PropertyCard::Property(_) => {}
+					PropertyCard::Property(_) => {},
+					PropertyCard::House | PropertyCard::Hotel => {},
 				}
 			}
 		}
@@ -693,24 +696,24 @@ impl GameState {
 					actions.push(Action::MoveToBank(i));
 					match card {
 						ActionCard::PassGo =>
-							actions.push(Action::TakeActionCard(i, ActionCardAction::PassGo)),
+							actions.push(Action::UseActionCard(i, ActionCardAction::PassGo)),
 						ActionCard::Birthday =>
-							actions.push(Action::TakeActionCard(i, ActionCardAction::Birthday)),
+							actions.push(Action::UseActionCard(i, ActionCardAction::Birthday)),
 						ActionCard::DebtCollector => {
 							other_pids.clone().for_each(|pid| {
-								actions.push(Action::TakeActionCard(i, ActionCardAction::DebtCollector{pid}));
+								actions.push(Action::UseActionCard(i, ActionCardAction::DebtCollector{pid}));
 							});
 						},
 						ActionCard::DoubleTheRent => {},
 						ActionCard::Rent(set_a, set_b) => {
 							if p.is_property_set_nonempty(set_a) {
 								for double_rents in 0..=num_double_rents {
-									actions.push(Action::TakeActionCard(i, ActionCardAction::Rent{set: *set_a, double_rents}));
+									actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_a, double_rents}));
 								}
 							}
 							if p.is_property_set_nonempty(set_b) {
 								for double_rents in 0..=num_double_rents {
-									actions.push(Action::TakeActionCard(i, ActionCardAction::Rent{set: *set_b, double_rents}));
+									actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_b, double_rents}));
 								}
 							}
 						},
@@ -718,26 +721,26 @@ impl GameState {
 							for set in p.nonempty_property_sets() {
 								for pid in other_pids.clone() {
 									for double_rents in 0..=num_double_rents {
-										actions.push(Action::TakeActionCard(i, ActionCardAction::RentAny{set, pid, double_rents}));
+										actions.push(Action::UseActionCard(i, ActionCardAction::RentAny{set, pid, double_rents}));
 									}
 								}
 							}
 						},
 						ActionCard::House => {
 							for set in p.full_property_sets() {
-								actions.push(Action::TakeActionCard(i, ActionCardAction::House{set}))
+								actions.push(Action::UseActionCard(i, ActionCardAction::House{set}))
 							}
 						},
 						ActionCard::Hotel => {
 							for set in p.full_property_sets() {
-								actions.push(Action::TakeActionCard(i, ActionCardAction::Hotel{set}))
+								actions.push(Action::UseActionCard(i, ActionCardAction::Hotel{set}))
 							}
 						},
 						ActionCard::ForcedDeal => {
 							for (my_set, my_card) in p.stealable_cards() {
 								for pid in other_pids.clone() {
 									for (other_set, other_card) in self.players[pid].stealable_cards() {
-										actions.push(Action::TakeActionCard(i, ActionCardAction::ForcedDeal{
+										actions.push(Action::UseActionCard(i, ActionCardAction::ForcedDeal{
 											my_set,
 											my_card,
 											pid,
@@ -751,7 +754,7 @@ impl GameState {
 						ActionCard::SlyDeal => {
 							for pid in other_pids.clone() {
 								for (set, card) in self.players[pid].stealable_cards() {
-									actions.push(Action::TakeActionCard(i, ActionCardAction::SlyDeal{
+									actions.push(Action::UseActionCard(i, ActionCardAction::SlyDeal{
 										pid,
 										set,
 										card,
@@ -763,7 +766,7 @@ impl GameState {
 						ActionCard::DealBreaker => {
 							for pid in other_pids.clone() {
 								for set in self.players[pid].full_property_sets() {
-									actions.push(Action::TakeActionCard(i, ActionCardAction::DealBreaker{pid, set}));
+									actions.push(Action::UseActionCard(i, ActionCardAction::DealBreaker{pid, set}));
 								}
 							}
 						},
@@ -781,6 +784,9 @@ impl GameState {
 					},
 					PropertyCard::Property(p) => {
 						actions.push(Action::BuildProperty(i, p.set()));
+					},
+					PropertyCard::House | PropertyCard::Hotel => {
+						panic!("Illegal card in hand: {:?} (use ActionCard::{{House, Hotel}} instead)", card);
 					}
 				},
 			}
@@ -849,6 +855,10 @@ impl Game {
 		None
 	}
 	
+	pub fn current_player(&mut self) -> &mut Player {
+		&mut self.state.players[self.state.current_player]
+	}
+	
 	pub fn run(&mut self) -> usize {
 		loop {
 			match self.get_winner() {
@@ -864,6 +874,10 @@ impl Game {
 		
 		let action = self.ais[p].think(&self.state);
 		self.take_action(action);
+		if self.state.actions_taken >= 3 {
+			// Next player
+			self.next_player();
+		}
 	}
 	
 	pub fn take_action(&mut self, action: Action) {
@@ -871,39 +885,45 @@ impl Game {
 			self.state.actions_taken += 1;
 		}
 		
-		let p = &mut self.state.players[self.state.current_player];
-		
 		match action {
 			Action::BuildProperty(i, set) => {
-				let c = p.hand.remove(i);
+				let c = self.current_player().hand.remove(i);
 				if let Card::PropertyCard(c) = c {
-					println!("Built property in set {:?}: {:?}", &set, &c);
-					p.properties.entry(set).or_insert_with(|| Vec::new()).push(c);
+					println!("Player {}: build property card {:?} in {:?} set", self.state.current_player, &c, set);
+					self.current_player().properties.entry(set).or_insert_with(|| Vec::new()).push(c);
 				} else {
 					panic!("invalid card (expected property card): {:?}", &c);
 				}
 			},
-			Action::TakeActionCard(i, action) => {
-				unimplemented!()
+			Action::UseActionCard(i, action) => {
+				let c = self.current_player().hand.remove(i);
+				println!("Player {}: use action card {:?}: {:?}", self.state.current_player, &c, action);
+				self.use_action_card(action);
 			},
 			Action::MoveToBank(i) => {
-				let c = p.hand.remove(i);
-				println!("Moved card to bank: {:?}", &c);
-				p.bank.push(c);
+				let c = self.current_player().hand.remove(i);
+				println!("Player {}: move card {:?} to bank for ${}", self.state.current_player, &c, c.value());
+				self.current_player().bank.push(c);
 			},
 			Action::MovePropertyWildcard((set_from, i), set_to) => {
-				let c = p.properties.get_mut(&set_from).unwrap().remove(i);
-				p.properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
+				let c = self.current_player().properties.get_mut(&set_from).unwrap().remove(i);
+				println!("Player {}: move property wildcard {:?} from {:?} to {:?}", self.state.current_player, &c, set_from, set_to);
+				self.current_player().properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
 			},
 			Action::Discard(i) => {
-				let c = p.hand.remove(i);
-				println!("Discarded card: {:?}", &c);
+				let c = self.current_player().hand.remove(i);
+				println!("Player {}: discarded card: {:?}", self.state.current_player, &c);
 				self.state.deck.push_back(c);
 			},
 			Action::Skip => {
+				println!("Player {}: skipped turn", self.state.current_player);
 				self.next_player();
 			}
 		}
+	}
+	
+	pub fn use_action_card(&mut self, _action: ActionCardAction) {
+		unimplemented!()
 	}
 	
 	pub fn next_player(&mut self) {
@@ -912,7 +932,7 @@ impl Game {
 		while p.hand.len() > MAX_CARDS_IN_HAND {
 			// Discard randomly
 			let c = p.hand.remove(thread_rng().gen_range(0, p.hand.len()));
-			println!("Discarded card: {:?}", &c);
+			println!("Player {}: discarded card: {:?}", self.state.current_player, &c);
 			self.state.deck.push_back(c);
 		}
 		
