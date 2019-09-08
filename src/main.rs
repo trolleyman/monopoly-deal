@@ -326,6 +326,14 @@ impl PropertyCard {
 			PropertyCard::Property(p) => p.value(),
 		}
 	}
+	
+	pub fn is_wildcard(&self) -> bool {
+		match self {
+			PropertyCard::Wildcard(_, _) => true,
+			PropertyCard::WildcardAny => true,
+			PropertyCard::Property(_) => false,
+		}
+	}
 }
 
 pub const MAX_CARDS_IN_HAND: usize = 7;
@@ -412,6 +420,7 @@ fn initial_deck() -> Vec<Card> {
 	deck
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum ActionCardAction {
 	/// Draw 2 extra cards.
 	PassGo,
@@ -436,9 +445,7 @@ pub enum ActionCardAction {
 	ForcedDeal{pid: usize},
 	/// Steal a property from another player.
 	SlyDeal{pid: usize},
-	// Use any time when an action is played against you.
-	//TODO: No,
-	/// Steal a complete set of properties from a player
+	/// Steal a complete set of properties from a player.
 	DealBreaker{pid: usize},
 }
 
@@ -464,7 +471,7 @@ impl Action {
 	pub fn is_free_action(&self) -> bool {
 		match self {
 			Action::BuildProperty(_, _) => false,
-			Action::TakeActionCard(_) => false,
+			Action::TakeActionCard(_, _) => false,
 			Action::MoveToBank(_) => false,
 			
 			Action::MovePropertyWildcard(_, _) => true,
@@ -475,7 +482,8 @@ impl Action {
 }
 
 pub trait Ai: AiClone + std::fmt::Debug {
-	fn think(&mut self, game: &Game) -> Action;
+	fn should_use_nope(&mut self, state: &GameState, action: ActionCardAction) -> bool;
+	fn think(&mut self, state: &GameState) -> Action;
 }
 
 pub trait AiClone {
@@ -494,28 +502,37 @@ impl Clone for Box<Ai> {
 	}
 }
 
-
-#[derive(Clone, Debug, Default)]
-pub struct RandomAi {}
+#[derive(Clone, Debug)]
+pub struct RandomAi {
+	pub pid: usize,
+}
+impl RandomAi {
+	pub fn new(pid: usize) -> RandomAi {
+		RandomAi {
+			pid
+		}
+	}
+}
 impl Ai for RandomAi {
-	fn think(&mut self, game: &Game) -> Action {
-		*game.get_valid_actions().choose(&mut thread_rng()).expect("no valid actions")
+	fn should_use_nope(&mut self, state: &GameState, action: ActionCardAction) -> bool {
+		random()
+	}
+	fn think(&mut self, state: &GameState) -> Action {
+		*state.get_valid_actions().choose(&mut thread_rng()).expect("no valid actions")
 	}
 }
 
 #[derive(Clone, Debug)]
 pub struct Player {
-	pub ai: Box<dyn Ai>,
-	pub i: usize,
+	pub id: usize,
 	pub hand: Vec<Card>,
 	pub bank: Vec<Card>,
 	pub properties: HashMap<PropertySet, Vec<PropertyCard>>,
 }
 impl Player {
-	pub fn new(i: usize) -> Player {
+	pub fn new(id: usize) -> Player {
 		Player {
-			ai: Box::new(RandomAi::default()),
-			i,
+			id,
 			hand: Vec::new(),
 			bank: Vec::new(),
 			properties: HashMap::new(),
@@ -531,83 +548,38 @@ impl Player {
 		}
 		sets
 	}
+	
+	pub fn num_double_rent_cards(&self) -> usize {
+		self.hand.iter()
+			.filter(|&&c| c == Card::ActionCard(ActionCard::DoubleTheRent))
+			.count()
+	}
+	
+	pub fn nonempty_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
+		self.properties.iter()
+			.filter(|(set, cards)| {
+				cards.iter().filter(|c| !c.is_wildcard()).count() > 0
+			})
+			.map(|(&set, _)| set)
+	}
+	
+	pub fn full_property_sets(&self) -> impl Iterator<Item=PropertySet> {
+		unimplemented!()
+	}
 }
 
 #[derive(Clone, Debug)]
-pub struct Game {
+pub struct GameState {
 	pub current_player: usize,
 	pub actions_taken: usize,
 	pub players: Vec<Player>,
 	pub deck: VecDeque<Card>,
 }
-impl Game {
-	pub fn new(n: usize) -> Game {
-		let mut i = 0;
-		let players = std::iter::repeat_with(|| { let p = Player::new(i); i += 1; p }).take(n).collect();
-		
-		let mut game = Game {
-			current_player: 0,
-			actions_taken: 0,
-			players,
-			deck: initial_deck().into(),
-		};
-		
-		// Deal 5 cards to each player
-		for p in 0..game.players.len() {
-			game.dealn(p, 5);
-		}
-		
-		// Deal 2 cards from the deck to the starting player
-		game.dealn(game.current_player, 2);
-		
-		game
-	}
-	
-	pub fn dealn(&mut self, player: usize, n: usize) {
-		for _ in 0..n {
-			self.deal(player);
-		}
-	}
-	
-	pub fn deal(&mut self, player: usize) {
-		if let Some(card) = self.deck.pop_front() {
-			self.players[player].hand.push(card);
-		} else {
-			println!("Warning: could not deal a card to player {} as the deck is out of cards", player);
-		}
-	}
-	
-	pub fn get_winner(&self) -> Option<usize> {
-		for p in 0..self.players.len() {
-			if self.players[p].num_full_sets() >= 3 {
-				return Some(p);
-			}
-		}
-		None
-	}
-	
-	pub fn run(&mut self) -> usize {
-		loop {
-			match self.get_winner() {
-				Some(w) => break w,
-				None => {},
-			}
-			self.step();
-		}
-	}
-	
-	pub fn step(&mut self) {
-		let p = self.current_player;
-		
-		let mut ai: Box<dyn Ai> = self.players[p].ai.clone();
-		let action = ai.think(self);
-		self.take_action(action);
-		self.players[p].ai = ai;
-	}
-	
+impl GameState {
 	pub fn get_valid_actions(&self) -> Vec<Action> {
 		let mut actions = Vec::new();
 		let p = &self.players[self.current_player];
+		let other_pids = (0..self.players.len()).filter(|pid| pid != self.current_player);
 		
 		// Add default actions
 		actions.push(Action::Skip);
@@ -639,13 +611,36 @@ impl Game {
 			return actions;
 		}
 		
+		let number_double_rents = p.num_double_rent_cards();
+		
 		// Add actions for each card in hand
 		for (i, card) in p.hand.iter().enumerate() {
 			match card {
 				Card::MoneyCard(_) => actions.push(Action::MoveToBank(i)),
-				Card::ActionCard(_) => {
-					actions.push(Action::TakeActionCard(i));
+				Card::ActionCard(card) => {
 					actions.push(Action::MoveToBank(i));
+					match card {
+						ActionCard::PassGo =>
+							actions.push(Action::TakeActionCard(i, ActionCardAction::PassGo)),
+						ActionCard::Birthday =>
+							actions.push(Action::TakeActionCard(i, ActionCardAction::Birthday)),
+						ActionCard::DebtCollector => {
+							other_pids.clone().for_each(|pid| {
+								actions.push(Action::TakeActionCard(i, ActionCardAction::DebtCollector{pid}));
+							});
+						},
+						ActionCard::DoubleTheRent => {},
+						ActionCard::Rent(set_a, set_b) => {
+							unimplemented!()
+						},
+						ActionCard::RentAny => unimplemented!(),
+						ActionCard::House => unimplemented!(),
+						ActionCard::Hotel => unimplemented!(),
+						ActionCard::ForcedDeal => unimplemented!(),
+						ActionCard::SlyDeal => unimplemented!(),
+						ActionCard::No => unimplemented!(),
+						ActionCard::DealBreaker => unimplemented!(),
+					}
 				},
 				Card::PropertyCard(card) => match card {
 					PropertyCard::Wildcard(set_a, set_b) => {
@@ -665,13 +660,91 @@ impl Game {
 		}
 		actions
 	}
+}
+
+#[derive(Clone, Debug)]
+pub struct Game {
+	/// Current state of the game
+	pub state: GameState,
+	/// AIs for each player
+	pub ais: Vec<Box<Ai>>,
+}
+impl Game {
+	pub fn new(n: usize) -> Game {
+		let mut players = Vec::with_capacity(n);
+		let mut ais: Vec<Box<dyn Ai>> = Vec::with_capacity(n);
+		for i in 0..n {
+			players.push(Player::new(i));
+			ais.push(Box::new(RandomAi::new(i)));
+		}
+		
+		let mut game = Game {
+			state: GameState {
+				current_player: 0,
+				actions_taken: 0,
+				players,
+				deck: initial_deck().into(),
+			},
+			ais,
+		};
+		
+		// Deal 5 cards to each player
+		for p in 0..game.state.players.len() {
+			game.dealn(p, 5);
+		}
+		
+		// Deal 2 cards from the deck to the starting player
+		game.dealn(game.state.current_player, 2);
+		
+		game
+	}
+	
+	pub fn dealn(&mut self, player: usize, n: usize) {
+		for _ in 0..n {
+			self.deal(player);
+		}
+	}
+	
+	pub fn deal(&mut self, player: usize) {
+		if let Some(card) = self.state.deck.pop_front() {
+			self.state.players[player].hand.push(card);
+		} else {
+			println!("Warning: could not deal a card to player {} as the deck is out of cards", player);
+		}
+	}
+	
+	pub fn get_winner(&self) -> Option<usize> {
+		for p in 0..self.state.players.len() {
+			if self.state.players[p].num_full_sets() >= 3 {
+				return Some(p);
+			}
+		}
+		None
+	}
+	
+	pub fn run(&mut self) -> usize {
+		loop {
+			match self.get_winner() {
+				Some(w) => break w,
+				None => {},
+			}
+			self.step();
+		}
+	}
+	
+	pub fn step(&mut self) {
+		let p = self.state.current_player;
+		
+		let action = self.ais[p].think(&self.state);
+		self.take_action(action);
+	}
 	
 	pub fn take_action(&mut self, action: Action) {
 		if !action.is_free_action() {
-			self.actions_taken += 1;
+			self.state.actions_taken += 1;
 		}
 		
-		let p = &mut self.players[self.current_player];
+		let p = &mut self.state.players[self.state.current_player];
 		
 		match action {
 			Action::BuildProperty(i, set) => {
@@ -698,7 +771,7 @@ impl Game {
 			Action::Discard(i) => {
 				let c = p.hand.remove(i);
 				println!("Discarded card: {:?}", &c);
-				self.deck.push_back(c);
+				self.state.deck.push_back(c);
 			},
 			Action::Skip => {
 				self.next_player();
@@ -707,24 +780,24 @@ impl Game {
 	}
 	
 	pub fn next_player(&mut self) {
-		let p = &mut self.players[self.current_player];
+		let p = &mut self.state.players[self.state.current_player];
 		// Check hand size
 		while p.hand.len() > MAX_CARDS_IN_HAND {
 			// Discard randomly
 			let c = p.hand.remove(thread_rng().gen_range(0, p.hand.len()));
 			println!("Discarded card: {:?}", &c);
-			self.deck.push_back(c);
+			self.state.deck.push_back(c);
 		}
 		
 		// Go to next player
-		self.current_player += 1;
-		if self.current_player > self.players.len() {
-			self.current_player = 0;
+		self.state.current_player += 1;
+		if self.state.current_player > self.state.players.len() {
+			self.state.current_player = 0;
 		}
-		self.actions_taken = 0;
+		self.state.actions_taken = 0;
 		
 		// Deal 2 cards from the deck to the new player
-		self.dealn(self.current_player, 2);
+		self.dealn(self.state.current_player, 2);
 	}
 }
 
