@@ -295,6 +295,8 @@ pub enum PropertyCard {
 	Wildcard(PropertySet, PropertySet),
 	WildcardAny,
 	Property(Property),
+	House,
+	Hotel,
 }
 impl From<Property> for PropertyCard {
 	fn from(p: Property) -> PropertyCard {
@@ -332,6 +334,38 @@ impl PropertyCard {
 			PropertyCard::Wildcard(_, _) => true,
 			PropertyCard::WildcardAny => true,
 			PropertyCard::Property(_) => false,
+			PropertyCard::House => false,
+			PropertyCard::Hotel => false,
+		}
+	}
+	
+	pub fn is_property(&self) -> bool {
+		match self {
+			PropertyCard::Wildcard(_, _) => false,
+			PropertyCard::WildcardAny => false,
+			PropertyCard::Property(_) => true,
+			PropertyCard::House => false,
+			PropertyCard::Hotel => false,
+		}
+	}
+	
+	pub fn is_house_or_hotel(&self) -> bool {
+		match self {
+			PropertyCard::Wildcard(_, _) => false,
+			PropertyCard::WildcardAny => false,
+			PropertyCard::Property(_) => false,
+			PropertyCard::House => true,
+			PropertyCard::Hotel => true,
+		}
+	}
+	
+	pub fn is_stealable(&self) -> bool {
+		match self {
+			PropertyCard::Wildcard(_, _) => true,
+			PropertyCard::WildcardAny => true,
+			PropertyCard::Property(_) => true,
+			PropertyCard::House => false,
+			PropertyCard::Hotel => false,
 		}
 	}
 }
@@ -436,17 +470,23 @@ pub enum ActionCardAction {
 	/// Add a house onto any full set to add $3 to the rent value.
 	/// 
 	/// Excludes stations and utilities.
-	House,
+	House{set: PropertySet},
 	/// Add onto any full set you own to add $4 to the rent value.
 	/// 
 	/// Excludes stations and utilities.
-	Hotel,
+	Hotel{set: PropertySet},
 	/// Swap any property with another player. Cannot be part of a full set.
-	ForcedDeal{pid: usize},
+	ForcedDeal{
+		my_set: PropertySet,
+		my_card: usize,
+		pid: usize,
+		other_set: PropertySet,
+		other_card: usize
+	},
 	/// Steal a property from another player.
-	SlyDeal{pid: usize},
+	SlyDeal{pid: usize, set: PropertySet, card: usize},
 	/// Steal a complete set of properties from a player.
-	DealBreaker{pid: usize},
+	DealBreaker{pid: usize, set: PropertySet},
 }
 
 /// Maximum number of actions allowed to be taken per turn
@@ -555,16 +595,46 @@ impl Player {
 			.count()
 	}
 	
-	pub fn nonempty_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
-		self.properties.iter()
-			.filter(|(set, cards)| {
-				cards.iter().filter(|c| !c.is_wildcard()).count() > 0
-			})
-			.map(|(&set, _)| set)
+	pub fn is_property_set_nonempty(&self, set: &PropertySet) -> bool {
+		if let Some(cards) = self.properties.get(set) {
+			cards.iter().filter(|c| c.is_property()).count() > 0
+		} else {
+			false
+		}
 	}
 	
-	pub fn full_property_sets(&self) -> impl Iterator<Item=PropertySet> {
-		unimplemented!()
+	pub fn is_property_set_full(&self, set: &PropertySet) -> bool {
+		if let Some(cards) = self.properties.get(set) {
+			// Not all non-property cards && number of non-house/hotel cards >= property set length
+			!cards.iter().all(|c| !c.is_property())
+				&& cards.iter().filter(|c| !c.is_house_or_hotel()).count() >= set.len()
+		} else {
+			false
+		}
+	}
+	
+	pub fn nonempty_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
+		self.properties.keys()
+			.filter(|set| self.is_property_set_nonempty(set))
+			.cloned()
+	}
+	
+	pub fn full_property_sets<'a>(&'a self) -> impl Iterator<Item=PropertySet> + 'a {
+		self.properties.keys()
+			.filter(|set| self.is_property_set_full(set))
+			.cloned()
+	}
+	
+	pub fn stealable_cards<'a>(&'a self) -> impl Iterator<Item=(PropertySet, usize)> + 'a {
+		self.properties.keys()
+			.filter(|set| self.is_property_set_nonempty(set))
+			.filter(|set| !self.is_property_set_full(set))
+			.flat_map(|set|
+				self.properties[set].iter()
+					.enumerate()
+					.filter(|(i, card)| card.is_stealable())
+					.map(|(i, _)| (*set, i))
+			)
 	}
 }
 
@@ -579,11 +649,13 @@ impl GameState {
 	pub fn get_valid_actions(&self) -> Vec<Action> {
 		let mut actions = Vec::new();
 		let p = &self.players[self.current_player];
-		let other_pids = (0..self.players.len()).filter(|pid| pid != self.current_player);
+		let other_pids = (0..self.players.len()).filter(|&pid| pid != self.current_player);
 		
 		// Add default actions
 		actions.push(Action::Skip);
-		actions.extend((0..p.hand.len()).map(|i| Action::Discard(i)));
+		if p.hand.len() > 7 {
+			actions.extend((0..p.hand.len()).map(|i| Action::Discard(i)));
+		}
 		
 		// Move property wildcard
 		for (&set, cards) in p.properties.iter() {
@@ -611,7 +683,7 @@ impl GameState {
 			return actions;
 		}
 		
-		let number_double_rents = p.num_double_rent_cards();
+		let num_double_rents = p.num_double_rent_cards();
 		
 		// Add actions for each card in hand
 		for (i, card) in p.hand.iter().enumerate() {
@@ -631,15 +703,70 @@ impl GameState {
 						},
 						ActionCard::DoubleTheRent => {},
 						ActionCard::Rent(set_a, set_b) => {
-							unimplemented!()
+							if p.is_property_set_nonempty(set_a) {
+								for double_rents in 0..=num_double_rents {
+									actions.push(Action::TakeActionCard(i, ActionCardAction::Rent{set: *set_a, double_rents}));
+								}
+							}
+							if p.is_property_set_nonempty(set_b) {
+								for double_rents in 0..=num_double_rents {
+									actions.push(Action::TakeActionCard(i, ActionCardAction::Rent{set: *set_b, double_rents}));
+								}
+							}
 						},
-						ActionCard::RentAny => unimplemented!(),
-						ActionCard::House => unimplemented!(),
-						ActionCard::Hotel => unimplemented!(),
-						ActionCard::ForcedDeal => unimplemented!(),
-						ActionCard::SlyDeal => unimplemented!(),
-						ActionCard::No => unimplemented!(),
-						ActionCard::DealBreaker => unimplemented!(),
+						ActionCard::RentAny => {
+							for set in p.nonempty_property_sets() {
+								for pid in other_pids.clone() {
+									for double_rents in 0..=num_double_rents {
+										actions.push(Action::TakeActionCard(i, ActionCardAction::RentAny{set, pid, double_rents}));
+									}
+								}
+							}
+						},
+						ActionCard::House => {
+							for set in p.full_property_sets() {
+								actions.push(Action::TakeActionCard(i, ActionCardAction::House{set}))
+							}
+						},
+						ActionCard::Hotel => {
+							for set in p.full_property_sets() {
+								actions.push(Action::TakeActionCard(i, ActionCardAction::Hotel{set}))
+							}
+						},
+						ActionCard::ForcedDeal => {
+							for (my_set, my_card) in p.stealable_cards() {
+								for pid in other_pids.clone() {
+									for (other_set, other_card) in self.players[pid].stealable_cards() {
+										actions.push(Action::TakeActionCard(i, ActionCardAction::ForcedDeal{
+											my_set,
+											my_card,
+											pid,
+											other_set,
+											other_card
+										}));
+									}
+								}
+							}
+						},
+						ActionCard::SlyDeal => {
+							for pid in other_pids.clone() {
+								for (set, card) in self.players[pid].stealable_cards() {
+									actions.push(Action::TakeActionCard(i, ActionCardAction::SlyDeal{
+										pid,
+										set,
+										card,
+									}));
+								}
+							}
+						},
+						ActionCard::No => {},
+						ActionCard::DealBreaker => {
+							for pid in other_pids.clone() {
+								for set in self.players[pid].full_property_sets() {
+									actions.push(Action::TakeActionCard(i, ActionCardAction::DealBreaker{pid, set}));
+								}
+							}
+						},
 					}
 				},
 				Card::PropertyCard(card) => match card {
@@ -756,7 +883,7 @@ impl Game {
 					panic!("invalid card (expected property card): {:?}", &c);
 				}
 			},
-			Action::TakeActionCard(i) => {
+			Action::TakeActionCard(i, action) => {
 				unimplemented!()
 			},
 			Action::MoveToBank(i) => {
