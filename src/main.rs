@@ -412,6 +412,36 @@ fn initial_deck() -> Vec<Card> {
 	deck
 }
 
+pub enum ActionCardAction {
+	/// Draw 2 extra cards.
+	PassGo,
+	/// Collect $2 from every player.
+	Birthday,
+	/// Collect $5 from the specified player.
+	DebtCollector{pid: usize},
+	/// Collect rent for the specified property set from all players.
+	/// Second argument is the number of `DoubleTheRent` cards used with this rent card.
+	Rent{set: PropertySet, double_rents: usize},
+	/// Force one player to pay you rent for properties in the set specified.
+	RentAny{set: PropertySet, pid: usize, double_rents: usize},
+	/// Add a house onto any full set to add $3 to the rent value.
+	/// 
+	/// Excludes stations and utilities.
+	House,
+	/// Add onto any full set you own to add $4 to the rent value.
+	/// 
+	/// Excludes stations and utilities.
+	Hotel,
+	/// Swap any property with another player. Cannot be part of a full set.
+	ForcedDeal{pid: usize},
+	/// Steal a property from another player.
+	SlyDeal{pid: usize},
+	// Use any time when an action is played against you.
+	//TODO: No,
+	/// Steal a complete set of properties from a player
+	DealBreaker{pid: usize},
+}
+
 /// Maximum number of actions allowed to be taken per turn
 pub const MAX_ACTIONS: usize = 3;
 
@@ -420,7 +450,7 @@ pub enum Action {
 	/// Build property
 	BuildProperty(usize, PropertySet),
 	/// Take action card
-	TakeActionCard(usize),
+	TakeActionCard(usize, ActionCardAction),
 	/// Move card to bank (either action or money card)
 	MoveToBank(usize),
 	/// Move property wildcard
@@ -693,7 +723,7 @@ impl Game {
 		}
 		self.actions_taken = 0;
 		
-		// Deal 2 cards from the deck
+		// Deal 2 cards from the deck to the new player
 		self.dealn(self.current_player, 2);
 	}
 }
