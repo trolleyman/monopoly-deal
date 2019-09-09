@@ -498,10 +498,10 @@ impl ActionCardAction {
 			ActionCardAction::Birthday             => true,
 			ActionCardAction::DebtCollector{pid}   => affects_pid == *pid,
 			ActionCardAction::DoubleTheRent        => false,
-			ActionCardAction::Rent{set}            => true,
-			ActionCardAction::RentAny{set, pid}    => affects_pid == *pid,
-			ActionCardAction::House{set}           => false,
-			ActionCardAction::Hotel{set}           => false,
+			ActionCardAction::Rent{..}             => true,
+			ActionCardAction::RentAny{pid, ..}     => affects_pid == *pid,
+			ActionCardAction::House{..}            => false,
+			ActionCardAction::Hotel{..}            => false,
 			ActionCardAction::ForcedDeal{pid, ..}  => affects_pid == *pid,
 			ActionCardAction::SlyDeal{pid, ..}     => affects_pid == *pid,
 			ActionCardAction::DealBreaker{pid, ..} => affects_pid == *pid,
@@ -543,21 +543,22 @@ impl Action {
 
 pub trait Ai: AiClone + std::fmt::Debug {
 	fn should_use_nope(&mut self, state: &GameState, action: ActionCardAction) -> bool;
+	fn choose_property_to_discard(&mut self, state: &GameState, value: u32) -> Option<(PropertySet, Option<usize>)>;
 	fn think(&mut self, state: &GameState) -> Action;
 }
 
 pub trait AiClone {
-	fn clone_box(&self) -> Box<Ai>;
+	fn clone_box(&self) -> Box<dyn Ai>;
 }
 
 impl<T: 'static + Ai + Clone> AiClone for T {
-	fn clone_box(&self) -> Box<Ai> {
+	fn clone_box(&self) -> Box<dyn Ai> {
 		Box::new(self.clone())
 	}
 }
 
-impl Clone for Box<Ai> {
-	fn clone(&self) -> Box<Ai> {
+impl Clone for Box<dyn Ai> {
+	fn clone(&self) -> Box<dyn Ai> {
 		self.clone_box()
 	}
 }
@@ -576,6 +577,9 @@ impl RandomAi {
 impl Ai for RandomAi {
 	fn should_use_nope(&mut self, _: &GameState, _: ActionCardAction) -> bool {
 		random()
+	}
+	fn choose_property_to_discard(&mut self, _state: &GameState, _value: u32) -> Option<(PropertySet, Option<usize>)> {
+		unimplemented!()
 	}
 	fn think(&mut self, state: &GameState) -> Action {
 		*state.get_valid_actions().choose(&mut thread_rng()).expect("no valid actions")
@@ -661,6 +665,29 @@ impl Player {
 					.enumerate()
 					.map(move |(i, _)| (set, i))
 			)
+	}
+
+	pub fn remove_card(&mut self, set: PropertySet, i: usize) -> PropertyCard {
+		self.properties.entry(set)
+			.or_insert_with(|| Vec::new())
+			.remove(i)
+	}
+
+	pub fn add_card(&mut self, set: PropertySet, card: PropertyCard) {
+		self.properties.entry(set)
+			.or_insert_with(|| Vec::new())
+			.push(card);
+	}
+
+	pub fn remove_set(&mut self, set: &PropertySet) -> Vec<PropertyCard> {
+		self.properties.remove(set)
+			.unwrap_or_else(|| Vec::new())
+	}
+
+	pub fn add_cards(&mut self, set: PropertySet, cards: impl IntoIterator<Item=PropertyCard>) {
+		self.properties.entry(set)
+			.or_insert_with(|| Vec::new())
+			.extend(cards);
 	}
 }
 
@@ -817,7 +844,7 @@ pub struct Game {
 	/// Current state of the game
 	pub state: GameState,
 	/// AIs for each player
-	pub ais: Vec<Box<Ai>>,
+	pub ais: Vec<Box<dyn Ai>>,
 }
 impl Game {
 	pub fn new(n: usize) -> Game {
@@ -909,7 +936,7 @@ impl Game {
 							let c = self.state.players[pid].hand.remove(no_i);
 							self.state.deck.push_back(c);
 							
-							println!("Player {}: Action noped by player {}: {:?}", cur_pid, pid, action);
+							println!("Player {}: player {} noped action {:?}", cur_pid, pid, action);
 							
 							action_noped = true;
 							break;
@@ -957,7 +984,7 @@ impl Game {
 			Action::MovePropertyWildcard((set_from, i), set_to) => {
 				let c = self.current_player_mut().properties.get_mut(&set_from).unwrap().remove(i);
 				println!("Player {}: move property wildcard {:?} from {:?} to {:?}", self.state.current_player, &c, set_from, set_to);
-				self.current_player().properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
+				self.current_player_mut().properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
 			},
 			Action::Discard(i) => {
 				let c = self.current_player_mut().hand.remove(i);
@@ -979,8 +1006,61 @@ impl Game {
 		}
 	}
 	
-	pub fn move_money(&mut self, _value: u32, _from_pid: usize, _to_pid: usize) {
-		unimplemented!();
+	pub fn move_money(&mut self, mut value: u32, from_pid: usize, to_pid: usize) {
+		loop {
+			if value == 0 {
+				break;
+			}
+
+			// Check bank for money
+			let mut bank: Vec<_> = self.state.players[from_pid].bank.iter()
+				.enumerate()
+				.map(|(i, &c)| (c.value(), i, c))
+				.collect();
+
+			bank.sort_by_key(|&(v, _, _)| (v > value, v));
+			if let Some((v, i, c)) = bank.pop() {
+				// Move card
+				self.state.players[from_pid].bank.remove(i);
+				self.state.players[to_pid].bank.push(c);
+
+				// Subtract value from total value
+				value = value.saturating_sub(v);
+				println!("Moved card {:?} in player {}'s bank to player {} to settle ${} of debt (${} debt left)", &c, from_pid, to_pid, v, value);
+				continue;
+			}
+
+			// Check properties
+			if let Some((set, card_i)) = self.ais[from_pid].choose_property_to_discard(&self.state, value) {
+				if let Some(card_i) = card_i {
+					// Specific card
+					let card = self.state.players[from_pid].properties.get_mut(&set).unwrap().remove(card_i);
+
+					// Move card to player
+					self.state.players[to_pid].add_card(set, card);
+					let debt_value = card.value();
+					value = value.saturating_sub(debt_value);
+					println!("Moved {:?} from {:?} set from player {} to player {} to settle ${} of debt (${} debt left)", &card, &set, from_pid, to_pid, debt_value, value);
+					continue;
+				} else {
+					// Full set
+					// Remove from player
+					let mut cards = self.state.players[from_pid].properties.remove(&set).unwrap();
+					let debt_value = cards.iter().map(|c| c.value()).sum();
+					value = value.saturating_sub(debt_value);
+
+					// Add to new player
+					self.state.players[to_pid].properties
+						.entry(set).or_insert_with(|| Vec::new())
+						.append(&mut cards);
+					println!("Moved {:?} set from player {} to player {} to settle ${} of debt (${} debt left)", set, from_pid, to_pid, debt_value, value);
+					continue;
+				}
+			}
+
+			// Stop loop -- no bank/properties left
+			break;
+		}
 	}
 	
 	pub fn use_action_card(&mut self, action: ActionCardAction) {
@@ -1026,13 +1106,19 @@ impl Game {
 				other_set,
 				other_card
 			} => {
-				unimplemented!();
+				let my_c = self.current_player_mut().remove_card(my_set, my_card);
+				let other_c = self.state.players[pid].remove_card(other_set, other_card);
+				
+				self.current_player_mut().add_card(other_set, other_c);
+				self.state.players[pid].add_card(my_set, my_c);
 			},
 			ActionCardAction::SlyDeal{pid, set, card} => {
-				unimplemented!();
+				let c = self.state.players[pid].remove_card(set, card);
+				self.current_player_mut().add_card(set, c);
 			},
 			ActionCardAction::DealBreaker{pid, set} => {
-				unimplemented!();
+				let cards = self.state.players[pid].remove_set(&set);
+				self.current_player_mut().add_cards(set, cards);
 			},
 		}
 	}
