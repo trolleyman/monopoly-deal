@@ -464,11 +464,12 @@ pub enum ActionCardAction {
 	Birthday,
 	/// Collect $5 from the specified player.
 	DebtCollector{pid: usize},
+	/// The next rent from this player is doubled.
+	DoubleTheRent,
 	/// Collect rent for the specified property set from all players.
-	/// Second argument is the number of `DoubleTheRent` cards used with this rent card.
-	Rent{set: PropertySet, double_rents: usize},
+	Rent{set: PropertySet},
 	/// Force one player to pay you rent for properties in the set specified.
-	RentAny{set: PropertySet, pid: usize, double_rents: usize},
+	RentAny{set: PropertySet, pid: usize},
 	/// Add a house onto any full set to add $3 to the rent value.
 	/// 
 	/// Excludes stations and utilities.
@@ -489,6 +490,23 @@ pub enum ActionCardAction {
 	SlyDeal{pid: usize, set: PropertySet, card: usize},
 	/// Steal a complete set of properties from a player.
 	DealBreaker{pid: usize, set: PropertySet},
+}
+impl ActionCardAction {
+	pub fn affects_player(&self, affects_pid: usize) -> bool {
+		match self {
+			ActionCardAction::PassGo               => false,
+			ActionCardAction::Birthday             => true,
+			ActionCardAction::DebtCollector{pid}   => affects_pid == *pid,
+			ActionCardAction::DoubleTheRent        => false,
+			ActionCardAction::Rent{set}            => true,
+			ActionCardAction::RentAny{set, pid}    => affects_pid == *pid,
+			ActionCardAction::House{set}           => false,
+			ActionCardAction::Hotel{set}           => false,
+			ActionCardAction::ForcedDeal{pid, ..}  => affects_pid == *pid,
+			ActionCardAction::SlyDeal{pid, ..}     => affects_pid == *pid,
+			ActionCardAction::DealBreaker{pid, ..} => affects_pid == *pid,
+		}
+	}
 }
 
 /// Maximum number of actions allowed to be taken per turn
@@ -581,6 +599,18 @@ impl Player {
 		}
 	}
 	
+	pub fn rent_value(&self, set: &PropertySet) -> u32 {
+		if let Some(cards) = self.properties.get(set) {
+			let num = cards.iter().filter(|c| !c.is_house_or_hotel()).count();
+			let num_houses = cards.iter().filter(|&&c| c == PropertyCard::House).count() as u32;
+			let num_hotels = cards.iter().filter(|&&c| c == PropertyCard::Hotel).count() as u32;
+			let value = set.rents()[num];
+			value + 3 * num_houses + 4 * num_hotels
+		} else {
+			0
+		}
+	}
+	
 	pub fn num_full_sets(&self) -> usize {
 		let mut sets = 0;
 		for (set, cards) in self.properties.iter() {
@@ -589,12 +619,6 @@ impl Player {
 			}
 		}
 		sets
-	}
-	
-	pub fn num_double_rent_cards(&self) -> usize {
-		self.hand.iter()
-			.filter(|&&c| c == Card::ActionCard(ActionCard::DoubleTheRent))
-			.count()
 	}
 	
 	pub fn is_property_set_nonempty(&self, set: &PropertySet) -> bool {
@@ -642,6 +666,7 @@ impl Player {
 
 #[derive(Clone, Debug)]
 pub struct GameState {
+	pub next_rent_doubled: usize,
 	pub current_player: usize,
 	pub actions_taken: usize,
 	pub players: Vec<Player>,
@@ -686,8 +711,6 @@ impl GameState {
 			return actions;
 		}
 		
-		let num_double_rents = p.num_double_rent_cards();
-		
 		// Add actions for each card in hand
 		for (i, card) in p.hand.iter().enumerate() {
 			match card {
@@ -707,22 +730,16 @@ impl GameState {
 						ActionCard::DoubleTheRent => {},
 						ActionCard::Rent(set_a, set_b) => {
 							if p.is_property_set_nonempty(set_a) {
-								for double_rents in 0..=num_double_rents {
-									actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_a, double_rents}));
-								}
+								actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_a}));
 							}
 							if p.is_property_set_nonempty(set_b) {
-								for double_rents in 0..=num_double_rents {
-									actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_b, double_rents}));
-								}
+								actions.push(Action::UseActionCard(i, ActionCardAction::Rent{set: *set_b}));
 							}
 						},
 						ActionCard::RentAny => {
 							for set in p.nonempty_property_sets() {
 								for pid in other_pids.clone() {
-									for double_rents in 0..=num_double_rents {
-										actions.push(Action::UseActionCard(i, ActionCardAction::RentAny{set, pid, double_rents}));
-									}
+									actions.push(Action::UseActionCard(i, ActionCardAction::RentAny{set, pid}));
 								}
 							}
 						},
@@ -813,6 +830,7 @@ impl Game {
 		
 		let mut game = Game {
 			state: GameState {
+				next_rent_doubled: 0,
 				current_player: 0,
 				actions_taken: 0,
 				players,
@@ -855,7 +873,11 @@ impl Game {
 		None
 	}
 	
-	pub fn current_player(&mut self) -> &mut Player {
+	pub fn current_player(&self) -> &Player {
+		&self.state.players[self.state.current_player]
+	}
+	
+	pub fn current_player_mut(&mut self) -> &mut Player {
 		&mut self.state.players[self.state.current_player]
 	}
 	
@@ -870,10 +892,37 @@ impl Game {
 	}
 	
 	pub fn step(&mut self) {
-		let p = self.state.current_player;
+		let cur_pid = self.state.current_player;
+		let action = self.ais[cur_pid].think(&self.state);
 		
-		let action = self.ais[p].think(&self.state);
-		self.take_action(action);
+		let mut action_noped = false;
+		if let Action::UseActionCard(action_card_i, action) = action {
+			for pid in 0..self.state.players.len() {
+				if pid != cur_pid && action.affects_player(pid) {
+					if let Some(no_i) = self.state.players[pid].hand.iter().position(|&c| c == Card::ActionCard(ActionCard::No)) {
+						if self.ais[pid].should_use_nope(&self.state, action) {
+							// Discard action card from blocked player's hand
+							let c = self.state.players[cur_pid].hand.remove(action_card_i);
+							self.state.deck.push_back(c);
+							
+							// Discard No card from player's hand
+							let c = self.state.players[pid].hand.remove(no_i);
+							self.state.deck.push_back(c);
+							
+							println!("Player {}: Action noped by player {}: {:?}", cur_pid, pid, action);
+							
+							action_noped = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		
+		if !action_noped {
+			self.take_action(action);
+		}
+		
 		if self.state.actions_taken >= 3 {
 			// Next player
 			self.next_player();
@@ -887,31 +936,31 @@ impl Game {
 		
 		match action {
 			Action::BuildProperty(i, set) => {
-				let c = self.current_player().hand.remove(i);
+				let c = self.current_player_mut().hand.remove(i);
 				if let Card::PropertyCard(c) = c {
 					println!("Player {}: build property card {:?} in {:?} set", self.state.current_player, &c, set);
-					self.current_player().properties.entry(set).or_insert_with(|| Vec::new()).push(c);
+					self.current_player_mut().properties.entry(set).or_insert_with(|| Vec::new()).push(c);
 				} else {
 					panic!("invalid card (expected property card): {:?}", &c);
 				}
 			},
 			Action::UseActionCard(i, action) => {
-				let c = self.current_player().hand.remove(i);
+				let c = self.current_player_mut().hand.remove(i);
 				println!("Player {}: use action card {:?}: {:?}", self.state.current_player, &c, action);
 				self.use_action_card(action);
 			},
 			Action::MoveToBank(i) => {
-				let c = self.current_player().hand.remove(i);
+				let c = self.current_player_mut().hand.remove(i);
 				println!("Player {}: move card {:?} to bank for ${}", self.state.current_player, &c, c.value());
-				self.current_player().bank.push(c);
+				self.current_player_mut().bank.push(c);
 			},
 			Action::MovePropertyWildcard((set_from, i), set_to) => {
-				let c = self.current_player().properties.get_mut(&set_from).unwrap().remove(i);
+				let c = self.current_player_mut().properties.get_mut(&set_from).unwrap().remove(i);
 				println!("Player {}: move property wildcard {:?} from {:?} to {:?}", self.state.current_player, &c, set_from, set_to);
 				self.current_player().properties.entry(set_to).or_insert_with(|| Vec::new()).push(c);
 			},
 			Action::Discard(i) => {
-				let c = self.current_player().hand.remove(i);
+				let c = self.current_player_mut().hand.remove(i);
 				println!("Player {}: discarded card: {:?}", self.state.current_player, &c);
 				self.state.deck.push_back(c);
 			},
@@ -922,8 +971,70 @@ impl Game {
 		}
 	}
 	
-	pub fn use_action_card(&mut self, _action: ActionCardAction) {
-		unimplemented!()
+	pub fn gain_money_from_others(&mut self, value: u32, pid: usize) {
+		for other_pid in 0..self.state.players.len() {
+			if other_pid != pid {
+				self.move_money(value, other_pid, pid);
+			}
+		}
+	}
+	
+	pub fn move_money(&mut self, _value: u32, _from_pid: usize, _to_pid: usize) {
+		unimplemented!();
+	}
+	
+	pub fn use_action_card(&mut self, action: ActionCardAction) {
+		match action {
+			ActionCardAction::PassGo => {
+				self.dealn(self.state.current_player, 2);
+			},
+			ActionCardAction::Birthday => {
+				self.gain_money_from_others(2, self.state.current_player);
+			},
+			ActionCardAction::DebtCollector{pid} => {
+				self.move_money(5, pid, self.state.current_player);
+			},
+			ActionCardAction::DoubleTheRent => {
+				self.state.next_rent_doubled += 1;
+			},
+			ActionCardAction::Rent{set} => {
+				let mut value = self.current_player().rent_value(&set);
+				for _ in 0..self.state.next_rent_doubled {
+					value *= 2;
+				}
+				self.state.next_rent_doubled = 0;
+				self.gain_money_from_others(value, self.state.current_player);
+			},
+			ActionCardAction::RentAny{set, pid} => {
+				let mut value = self.current_player().rent_value(&set);
+				for _ in 0..self.state.next_rent_doubled {
+					value *= 2;
+				}
+				self.state.next_rent_doubled = 0;
+				self.move_money(value, pid, self.state.current_player);
+			},
+			ActionCardAction::House{set} => {
+				self.current_player_mut().properties.entry(set).or_insert_with(|| Vec::new()).push(PropertyCard::House);
+			},
+			ActionCardAction::Hotel{set} => {
+				self.current_player_mut().properties.entry(set).or_insert_with(|| Vec::new()).push(PropertyCard::Hotel);
+			},
+			ActionCardAction::ForcedDeal{
+				my_set,
+				my_card,
+				pid,
+				other_set,
+				other_card
+			} => {
+				unimplemented!();
+			},
+			ActionCardAction::SlyDeal{pid, set, card} => {
+				unimplemented!();
+			},
+			ActionCardAction::DealBreaker{pid, set} => {
+				unimplemented!();
+			},
+		}
 	}
 	
 	pub fn next_player(&mut self) {
@@ -936,9 +1047,12 @@ impl Game {
 			self.state.deck.push_back(c);
 		}
 		
+		// Reset double rent
+		self.state.next_rent_doubled = 0;
+		
 		// Go to next player
 		self.state.current_player += 1;
-		if self.state.current_player > self.state.players.len() {
+		if self.state.current_player >= self.state.players.len() {
 			self.state.current_player = 0;
 		}
 		self.state.actions_taken = 0;
